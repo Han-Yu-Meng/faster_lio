@@ -65,10 +65,6 @@ class FasterLIO : public fins::Node {
                                 .greater_than(5);
     max_mean_residual_ = ps.get("FastLIO.localization.max_mean_residual", 1.11)
                              .greater_than(0.0);
-    max_update_translation_ = ps.get("FastLIO.localization.max_update_translation", 0.5)
-                                  .greater_than(0.0);
-    max_update_rotation_deg_ = ps.get("FastLIO.localization.max_update_rotation_deg", 30.0)
-                                   .greater_than(0.0);
     failures_before_lost_ = ps.get("FastLIO.localization.failures_before_lost", 5)
                                 .greater_than(0);
     good_frames_to_lock_ = ps.get("FastLIO.localization.good_frames_to_lock", 3)
@@ -267,15 +263,11 @@ class FasterLIO : public fins::Node {
         continue;
       }
 
-      auto state = mapper_->GetState();
-      double jump = (state.pos_ - prev_state_.pos_).norm();
-      double turn = lightning::SO3(state.rot_ * prev_state_.rot_.inverse()).log().norm() *
-                    180.0 / M_PI;
-      prev_state_ = state;
       double res = mapper_->GetLidarResidualMean();
       int feat = mapper_->GetEffectFeatNum();
-      bool valid = feat >= min_effective_points_ && res <= max_mean_residual_ &&
-                   jump <= max_update_translation_ && turn <= max_update_rotation_deg_;
+      // 配准质量只由残差和有效点数决定。状态跳变是真实运动（快速旋转、断流后
+      // 帧间隔变大），不是匹配失败；用它当门限会误判并触发无谓的 LOST/重定位。
+      bool valid = feat >= min_effective_points_ && res <= max_mean_residual_;
       {
         std::lock_guard<std::mutex> lock(state_mutex_);
         if (valid) {
@@ -288,8 +280,7 @@ class FasterLIO : public fins::Node {
             fixed_map_active_ = false;
             tracking_status_ = "LOST";
           }
-          logger->warn("[FixedMap] Rejected update: features={} residual={:.3f} step={:.3f} angle={:.2f}",
-                       feat, res, jump, turn);
+          logger->warn("[FixedMap] Rejected update: features={} residual={:.3f}", feat, res);
         }
       }
 
@@ -366,7 +357,6 @@ class FasterLIO : public fins::Node {
       return;
     }
     map_to_odom_ = alignment;
-    prev_state_ = mapper_->GetState();
     fixed_map_active_ = true;
     good_matches_ = bad_matches_ = 0;
     tracking_status_ = "TRACKING";
@@ -598,7 +588,6 @@ class FasterLIO : public fins::Node {
   int good_matches_ = 0, bad_matches_ = 0;
   bool fixed_map_active_ = false;
   Eigen::Isometry3d map_to_odom_ = Eigen::Isometry3d::Identity();
-  lightning::NavState prev_state_;
 
   std::mutex snapshot_mutex_;
   lightning::ESKF kf_copy_;
@@ -616,7 +605,6 @@ class FasterLIO : public fins::Node {
   bool imu_rate_output_ = true;
   std::string map_path_, initial_frame_ = "odom", base_link_frame_ = "base_link";
   double map_leaf_size_ = 0.15, max_mean_residual_ = 1.11;
-  double max_update_translation_ = 0.5, max_update_rotation_deg_ = 30.0;
   double max_alignment_age_ = 60.0;
   int min_effective_points_ = 30, failures_before_lost_ = 5, good_frames_to_lock_ = 3;
 };
