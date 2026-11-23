@@ -1,0 +1,23 @@
+name: "faster_lio"
+version: "0.1.0"
+description: "FasterLIO-based fixed-map localization for RoboSense Airy, with FAST_LIO-compatible finevision ports."
+maintainers:
+  - name: "fins"
+    email: "fins@sjtu.edu.cn"
+depends:
+  Eigen3: "3.4.0"
+  OpenMP: "system"
+
+  geometry_msgs: "system"
+  std_msgs: "system"
+  nav_msgs: "system"
+  sensor_msgs: "system"
+
+  PCL: "system"
+  pcl_conversions: "system"
+
+  glog: "system"
+  yaml-cpp: "system"
+
+licenses:
+  - "GPL-3.0-only"
