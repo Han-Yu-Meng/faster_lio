@@ -9,6 +9,11 @@ find_package(livox_ros_driver2 REQUIRED)
 find_package(glog REQUIRED)
 find_package(yaml-cpp REQUIRED)
 
+# 发行版打包的 yaml-cpp 只导出裸目标，补一个兼容别名以保留上游写法
+if(TARGET yaml-cpp AND NOT TARGET yaml-cpp::yaml-cpp)
+    add_library(yaml-cpp::yaml-cpp ALIAS yaml-cpp)
+endif()
+
 add_compile_options(
     -Wno-reorder
     -Wno-unused-parameter
