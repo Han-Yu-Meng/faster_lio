@@ -162,15 +162,22 @@ class FasterLIO : public fins::Node {
     imu->linear_acceleration = acc;
     mapper_->ProcessIMU(imu);
 
-    // IMU-rate odometry prediction on a private filter copy.
+    // 在私有滤波器副本上做 IMU-rate 递推，供 /Odometry 使用。
+    // lightning 的 ESKF::oplus 里 vel_ 递推被注释掉（上游如此），state.vel_
+    // 只在 lidar 更新时才跳变，按 IMU 频率发布就会呈阶梯状。这里按 FAST_LIO
+    // IKFoM 的运动方程自己积分速度：v += (R * acc + g) * dt，起点在每次
+    // lidar 更新后由 ESKF 修正值重置（见 backend_loop）。
     {
       std::lock_guard<std::mutex> lock(snapshot_mutex_);
-      if (!imu_rate_live_) return;
+      if (!odom_vel_ready_) return;
       double dt = (last_imu_time_ < 0.0) ? 0.005 : (imu->timestamp - last_imu_time_);
       last_imu_time_ = imu->timestamp;
       if (dt <= 0.0 || dt > 0.5) return;
       kf_copy_.Predict(dt, Q_, imu->angular_velocity, imu->linear_acceleration);
       auto state = kf_copy_.GetX();
+      odom_vel_world_ += (state.rot_.matrix() * imu->linear_acceleration + state.grav_) * dt;
+
+      if (!imu_rate_live_) return;
       // 角速度：预旋后的 gyro 减陀螺零偏，滑动窗口平滑（FAST_LIO 同款）。
       lightning::Vec3d omega_body = imu->angular_velocity - state.bg_;
       if (imu_window_size_ > 0) {
@@ -182,7 +189,7 @@ class FasterLIO : public fins::Node {
         }
         omega_body = ang_vel_sum_ / static_cast<double>(ang_vel_window_.size());
       }
-      publish_pose(state, acq_time, omega_body);
+      publish_pose(state, acq_time, omega_body, odom_vel_world_);
     }
   }
 
@@ -290,6 +297,10 @@ class FasterLIO : public fins::Node {
         kf_copy_ = mapper_->SnapshotIMUFilter();
         Q_ = mapper_->GetQ();
         last_imu_time_ = -1.0;
+        // 每次 lidar 更新后用 ESKF 修正后的速度重置 IMU 积分起点，
+        // 既保留 lidar 的绝对速度约束，又让帧间速度按 IMU 连续变化。
+        odom_vel_world_ = kf_copy_.GetX().vel_;
+        odom_vel_ready_ = true;
         std::lock_guard<std::mutex> slock(state_mutex_);
         imu_rate_live_ = imu_rate_output_ && fixed_map_active_ &&
                          tracking_status_ == "LOCKED" && bad_matches_ == 0;
@@ -381,7 +392,10 @@ class FasterLIO : public fins::Node {
         last_scan_rot_.rot = st.rot_;
         last_scan_rot_.time = st.timestamp_;
         last_scan_rot_.valid = true;
-        publish_pose(st, ts, omega_body);
+        // 与 IMU-rate 路径共用同一速度：ESKF 修正值 + 帧间 IMU 积分，
+        // 避免只用 state.vel_ 造成的阶梯。
+        publish_pose(st, ts, omega_body,
+                     odom_vel_ready_ ? odom_vel_world_ : st.vel_);
       }
     }
     publish_clouds(ts);
@@ -399,8 +413,10 @@ class FasterLIO : public fins::Node {
   }
 
   // ang_vel_body: 车体(base_link)系角速度 rad/s（已减零偏、已预旋到车体系）。
+  // vel_world: 世界系速度（ESKF 修正值 + IMU 积分），用于 twist.linear。
   void publish_pose(const lightning::NavState &state, const fins::AcqTime &ts,
-                    const lightning::Vec3d &ang_vel_body) {
+                    const lightning::Vec3d &ang_vel_body,
+                    const lightning::Vec3d &vel_world) {
     lightning::Mat3d Rb;
     lightning::Vec3d tb;
     {
@@ -440,10 +456,10 @@ class FasterLIO : public fins::Node {
     odom.pose.pose.orientation.w = q.w();
 
     // ---- twist：参考 FAST_LIO laserMapping.cpp 的计算 ----
-    // state.vel_ 是 IMU(body) 原点在世界系下的速度；转到 IMU 体系后做刚体
-    // 速度修正，再转到 base_link。lightning 预旋后 IMU 体系已对齐车体，
+    // vel_world 是 body 原点在世界系下的速度（已按 IMU 连续积分）；转到 body
+    // 体系后做刚体速度修正。lightning 预旋后 body 即 base_link，
     // 故 ang_vel_body 直接作为车体角速度，不再乘 R_LI^T。
-    lightning::Vec3d vel_imu_in_imu = R_WB.transpose() * state.vel_;
+    lightning::Vec3d vel_imu_in_imu = R_WB.transpose() * vel_world;
     // p_base 相对 IMU 原点的杆臂（IMU 体系）：lightning 外参已注入为 lidar->base，
     // body 即 base，杆臂近似为零；保留刚体项以兼容降级路径。
     lightning::Vec3d lever_imu = lightning::Vec3d::Zero();
@@ -594,6 +610,10 @@ class FasterLIO : public fins::Node {
   lightning::ESKF::ProcessNoiseType Q_ = lightning::ESKF::ProcessNoiseType::Identity();
   bool imu_rate_live_ = false;
   double last_imu_time_ = -1.0;
+  // lightning ESKF 的 oplus 不递推 vel_，直接发布 state.vel_ 会呈阶梯状。
+  // 这里按 FAST_LIO IKFoM 的运动方程在 IMU 回调里积分速度，lidar 更新后重置。
+  lightning::Vec3d odom_vel_world_ = lightning::Vec3d::Zero();
+  bool odom_vel_ready_ = false;
   // twist 计算：IMU-rate 角速度滑动窗口（FAST_LIO 同款），scan-rate 角速度取自相邻帧姿态差。
   int imu_window_size_ = 10;
   std::deque<lightning::Vec3d> ang_vel_window_;
